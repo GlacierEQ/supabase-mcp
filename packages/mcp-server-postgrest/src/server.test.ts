@@ -261,7 +261,7 @@ describe('tools', () => {
       throw new Error('no content');
     }
 
-    const result = JSON.parse(firstContent.text);
+    const { result } = JSON.parse(firstContent.text);
 
     expect(result).toMatchInlineSnapshot([
       {
@@ -320,7 +320,7 @@ describe('tools', () => {
       throw new Error('no content');
     }
 
-    const [result] = JSON.parse(firstContent.text);
+    const [result] = JSON.parse(firstContent.text).result;
 
     expect(result).toMatchObject({
       title: 'Test',
@@ -337,6 +337,28 @@ describe('tools', () => {
         path: `/todos?id=eq.${result.id}`,
       },
     });
+  });
+
+  test('path traversal is normalized', async () => {
+    const { client } = await setup();
+    const output = await client.callTool({
+      name: 'postgrestRequest',
+      arguments: {
+        method: 'GET',
+        path: '/foo/../todos?select=title&order=id.asc',
+      },
+    });
+
+    const [firstContent] = output.content as any[];
+
+    if (!firstContent) {
+      throw new Error('no content');
+    }
+
+    const { result } = JSON.parse(firstContent.text);
+
+    expect(Array.isArray(result)).toBe(true);
+    expect(result[0]).toMatchObject({ title: 'Buy groceries' });
   });
 
   test('sql-to-rest', async () => {

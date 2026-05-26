@@ -1,5 +1,7 @@
 # Supabase MCP Server
 
+[![MCP Registry Version](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fregistry.modelcontextprotocol.io%2Fv0.1%2Fservers%2Fcom.supabase%252Fmcp%2Fversions%2Flatest&query=%24.server.version&label=MCP%20Registry&logo=modelcontextprotocol)](https://registry.modelcontextprotocol.io/?q=com.supabase%2Fmcp)
+
 > Connect your Supabase projects to Cursor, Claude, Windsurf, and other AI assistants.
 
 ![supabase-mcp-demo](https://github.com/user-attachments/assets/3fce101a-b7d4-482f-9182-0be70ed1ad56)
@@ -15,11 +17,11 @@ Before setting up the MCP server, we recommend you read our [security best pract
 
 ### 2. Configure your MCP client
 
-The Supabase MCP server is hosted at `https://mcp.supabase.com/mcp` and supports the Streamable HTTP transport with OAuth authentication. If you're running Supabase locally with [Supabase CLI](https://supabase.com/docs/guides/local-development/cli/getting-started), you can access the MCP server at `http://localhost:54321/mcp` with a subset of tools.
+To configure the Supabase MCP server on your client, visit our [setup documentation](https://supabase.com/docs/guides/getting-started/mcp#step-2-configure-your-ai-tool). You can also generate a custom MCP URL for your project by visiting the [MCP connection tab](https://supabase.com/dashboard/project/_?showConnect=true&connectTab=mcp) in the Supabase dashboard.
 
-The easiest way to connect your MCP client (such as Cursor) to your project is clicking [Connect](https://supabase.com/dashboard/project/_?showConnect=true&tab=mcp) in the Supabase dashboard and navigating to the MCP tab. There you can choose options such as [feature groups](#feature-groups), and generate one-click installers or config entries for popular clients.
+Your MCP client will automatically prompt you to log in to Supabase during setup. Be sure to choose the organization that contains the project you wish to work with.
 
-Most MCP clients store the configuration as JSON in the following format:
+Most MCP clients require the following information:
 
 ```json
 {
@@ -32,9 +34,15 @@ Most MCP clients store the configuration as JSON in the following format:
 }
 ```
 
-Your MCP client will automatically prompt you to login to Supabase during setup. This will open a browser window where you can login to your Supabase account and grant access to the MCP client. Be sure to choose the organization that contains the project you wish to work with. In the future, we'll offer more fine grain control over these permissions.
+If you don't see your MCP client listed in our documentation, check your client's MCP documentation and copy the above MCP information into their expected format (json, yaml, etc).
 
-For more information, visit the [Supabase MCP docs](https://supabase.com/docs/guides/getting-started/mcp).
+#### CLI
+
+If you're running Supabase locally with [Supabase CLI](https://supabase.com/docs/guides/local-development/cli/getting-started), you can access the MCP server at `http://localhost:54321/mcp`. Currently, the MCP Server in CLI environments offers a limited subset of tools and no OAuth 2.1.
+
+#### Self-hosted
+
+For [self-hosted Supabase](https://supabase.com/docs/guides/self-hosting/docker), check the [Enabling MCP server](https://supabase.com/docs/guides/self-hosting/enable-mcp) page. Currently, the MCP Server in self-hosted environments offers a limited subset of tools and no OAuth 2.1.
 
 ## Options
 
@@ -48,7 +56,7 @@ When using the URL in the dashboard or docs, these parameters will be populated 
 
 ### Project scoped mode
 
-Without project scoping, the MCP server will have access to all organizations and projects in your Supabase account. We recommend you restrict the server to a specific project by setting the `project_ref` query parameter in the server URL:
+Without project scoping, the MCP server will have access to all projects in your Supabase organization. We recommend you restrict the server to a specific project by setting the `project_ref` query parameter in the server URL:
 
 ```
 https://mcp.supabase.com/mcp?project_ref=<project-ref>
@@ -141,7 +149,7 @@ Enabled by default. Use `debugging` to target this group of tools with the [`fea
 Enabled by default. Use `development` to target this group of tools with the [`features`](#feature-groups) option.
 
 - `get_project_url`: Gets the API URL for a project.
-- `get_anon_key`: Gets the anonymous API key for a project.
+- `get_publishable_keys`: Gets the anonymous API keys for a project. Returns an array of client-safe API keys including legacy anon keys and modern publishable keys. Publishable keys are recommended for new applications.
 - `generate_typescript_types`: Generates TypeScript types based on the database schema. LLMs can save this to a file and use it in their code.
 
 #### Edge Functions
@@ -203,6 +211,66 @@ We recommend the following best practices to mitigate security risks when using 
 - **Branching**: Use Supabase's [branching feature](https://supabase.com/docs/guides/deployment/branching) to create a development branch for your database. This allows you to test changes in a safe environment before merging them to production.
 
 - **Feature groups**: The server allows you to enable or disable specific [tool groups](#feature-groups), so you can control which tools are available to the LLM. This helps reduce the attack surface and limits the actions that LLMs can perform to only those that you need.
+
+## Usage with AI SDK's MCP Client
+
+The `@supabase/mcp-server-supabase` package exports `createToolSchemas()` to populate input and output schemas for Vercel AI SDK's [MCP client](https://ai-sdk.dev/docs/ai-sdk-core/mcp-tools). This allows Supabase MCP tools to be treated as static tools with client-side validation and inferred TypeScript types for their inputs and outputs.
+
+```ts
+import { createToolSchemas } from '@supabase/mcp-server-supabase';
+import { createMCPClient } from '@ai-sdk/mcp';
+import { streamText } from 'ai';
+
+const mcpClient = await createMCPClient({
+  transport: {
+    type: 'http',
+    url: 'https://mcp.supabase.com/mcp',
+  },
+});
+
+const tools = await mcpClient.tools({
+  schemas: createToolSchemas(),
+});
+
+const result = streamText({ model, tools, prompt: '...' });
+
+for (const step of await result.steps) {
+  for (const toolResult of step.staticToolResults) {
+    if (toolResult.toolName === 'get_project_url') {
+      toolResult.input;  // { project_id: string }
+      toolResult.output; // { url: string }
+    }
+  }
+}
+```
+
+`createToolSchemas()` accepts similar filtering options as the MCP server's URL parameters:
+
+- `features`: Restrict to specific [feature groups](#feature-groups) (e.g. `['database', 'docs']`). Defaults to all default feature groups.
+- `projectScoped`: When `true`, omits `project_id` from tool input schemas and excludes account-level tools — use when connecting to a server configured with `project_ref`. Defaults to `false`.
+- `readOnly`: When `true`, excludes mutating tools — use when connecting to a server configured with `read_only=true`. Defaults to `false`.
+
+```ts
+const mcpClient = await createMCPClient({
+  transport: {
+    type: 'http',
+    url: 'https://mcp.supabase.com/mcp?project_ref=<project-ref>&read_only=true&features=database,docs',
+  },
+});
+
+const tools = await mcpClient.tools({
+  schemas: createToolSchemas({
+    features: ['database', 'docs'],
+    projectScoped: true,
+    readOnly: true,
+  }),
+});
+```
+
+> [!NOTE]
+> This server does not send `structuredContent` in MCP tool results. AI SDK falls back to parsing JSON from `content` text.
+
+For more information, see [Schema Definition](https://ai-sdk.dev/docs/ai-sdk-core/mcp-tools#schema-definition) and [Typed Tool Outputs](https://ai-sdk.dev/docs/ai-sdk-core/mcp-tools#typed-tool-outputs) in the AI SDK docs.
 
 ## Other MCP servers
 

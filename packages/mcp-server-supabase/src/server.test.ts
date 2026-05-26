@@ -5,35 +5,49 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { StreamTransport } from '@supabase/mcp-utils';
 import { codeBlock, stripIndent } from 'common-tags';
+import gqlmin from 'gqlmin';
 import { setupServer } from 'msw/node';
-import { beforeEach, describe, expect, test } from 'vitest';
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
+import { globalRegistry } from 'zod/v4';
 import {
   ACCESS_TOKEN,
   API_URL,
   contentApiMockSchema,
+  createBranch,
   createOrganization,
   createProject,
-  createBranch,
   MCP_CLIENT_NAME,
   MCP_CLIENT_VERSION,
   mockBranches,
   mockContentApi,
+  mockContentApiSchemaLoadCount,
   mockManagementApi,
   mockOrgs,
   mockProjects,
 } from '../test/mocks.js';
 import { createSupabaseApiPlatform } from './platform/api-platform.js';
-import { BRANCH_COST_HOURLY, PROJECT_COST_MONTHLY } from './pricing.js';
-import { createSupabaseMcpServer } from './server.js';
 import type { SupabasePlatform } from './platform/types.js';
+import { BRANCH_COST_HOURLY, PROJECT_COST_MONTHLY } from './pricing.js';
+import { createSupabaseMcpServer, instructions } from './server.js';
+import {
+  createToolSchemas,
+  supabaseMcpToolSchemas,
+} from './tools/tool-schemas.js';
+
+let mockServer: ReturnType<typeof setupServer> | undefined;
 
 beforeEach(async () => {
   mockOrgs.clear();
   mockProjects.clear();
   mockBranches.clear();
+  mockContentApiSchemaLoadCount.value = 0;
 
-  const server = setupServer(...mockContentApi, ...mockManagementApi);
-  server.listen({ onUnhandledRequest: 'error' });
+  mockServer = setupServer(...mockContentApi, ...mockManagementApi);
+  mockServer.listen({ onUnhandledRequest: 'error' });
+});
+
+afterEach(() => {
+  mockServer?.close();
 });
 
 type SetupOptions = {
@@ -116,6 +130,13 @@ async function setup(options: SetupOptions = {}) {
   return { client, clientTransport, callTool, server, serverTransport };
 }
 
+describe('init', () => {
+  test('server returns instructions', async () => {
+    const { client } = await setup();
+    expect(client.getInstructions()).toBe(instructions);
+  });
+});
+
 describe('tools', () => {
   test('list organizations', async () => {
     const { callTool } = await setup();
@@ -136,10 +157,12 @@ describe('tools', () => {
       arguments: {},
     });
 
-    expect(result).toEqual([
-      { id: org1.id, name: org1.name },
-      { id: org2.id, name: org2.name },
-    ]);
+    expect(result).toEqual({
+      organizations: [
+        { id: org1.id, slug: org1.slug, name: org1.name },
+        { id: org2.id, slug: org2.slug, name: org2.name },
+      ],
+    });
   });
 
   test('get organization', async () => {
@@ -178,9 +201,11 @@ describe('tools', () => {
       },
     });
 
-    expect(result).toEqual(
-      'The new project will cost $0 monthly. You must repeat this to the user and confirm their understanding.'
-    );
+    expect(result).toEqual({
+      type: 'project',
+      amount: 0,
+      recurrence: 'monthly',
+    });
   });
 
   test('get next project cost for paid org with 0 projects', async () => {
@@ -200,9 +225,11 @@ describe('tools', () => {
       },
     });
 
-    expect(result).toEqual(
-      'The new project will cost $0 monthly. You must repeat this to the user and confirm their understanding.'
-    );
+    expect(result).toEqual({
+      type: 'project',
+      amount: 0,
+      recurrence: 'monthly',
+    });
   });
 
   test('get next project cost for paid org with > 0 active projects', async () => {
@@ -229,9 +256,11 @@ describe('tools', () => {
       },
     });
 
-    expect(result).toEqual(
-      `The new project will cost $${PROJECT_COST_MONTHLY} monthly. You must repeat this to the user and confirm their understanding.`
-    );
+    expect(result).toEqual({
+      type: 'project',
+      amount: PROJECT_COST_MONTHLY,
+      recurrence: 'monthly',
+    });
   });
 
   test('get next project cost for paid org with > 0 inactive projects', async () => {
@@ -258,9 +287,11 @@ describe('tools', () => {
       },
     });
 
-    expect(result).toEqual(
-      `The new project will cost $0 monthly. You must repeat this to the user and confirm their understanding.`
-    );
+    expect(result).toEqual({
+      type: 'project',
+      amount: 0,
+      recurrence: 'monthly',
+    });
   });
 
   test('get branch cost', async () => {
@@ -280,9 +311,11 @@ describe('tools', () => {
       },
     });
 
-    expect(result).toEqual(
-      `The new branch will cost $${BRANCH_COST_HOURLY} hourly. You must repeat this to the user and confirm their understanding.`
-    );
+    expect(result).toEqual({
+      type: 'branch',
+      amount: BRANCH_COST_HOURLY,
+      recurrence: 'hourly',
+    });
   });
 
   test('list projects', async () => {
@@ -311,7 +344,7 @@ describe('tools', () => {
       arguments: {},
     });
 
-    expect(result).toEqual([project1.details, project2.details]);
+    expect(result).toEqual({ projects: [project1.details, project2.details] });
   });
 
   test('get project', async () => {
@@ -348,7 +381,7 @@ describe('tools', () => {
       allowed_release_channels: ['ga'],
     });
 
-    const confirm_cost_id = await callTool({
+    const confirm_cost_id_result = await callTool({
       name: 'confirm_cost',
       arguments: {
         type: 'project',
@@ -361,7 +394,7 @@ describe('tools', () => {
       name: 'New Project',
       region: 'us-east-1',
       organization_id: freeOrg.id,
-      confirm_cost_id,
+      confirm_cost_id: confirm_cost_id_result.confirmation_id,
     };
 
     const result = await callTool({
@@ -369,11 +402,13 @@ describe('tools', () => {
       arguments: newProject,
     });
 
-    const { confirm_cost_id: _, ...projectInfo } = newProject;
-
     expect(result).toEqual({
-      ...projectInfo,
       id: expect.stringMatching(/^.+$/),
+      ref: expect.stringMatching(/^.+$/),
+      name: newProject.name,
+      region: newProject.region,
+      organization_id: newProject.organization_id,
+      organization_slug: newProject.organization_id,
       created_at: expect.stringMatching(
         /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/
       ),
@@ -390,7 +425,7 @@ describe('tools', () => {
       allowed_release_channels: ['ga'],
     });
 
-    const confirm_cost_id = await callTool({
+    const confirm_cost_id_result = await callTool({
       name: 'confirm_cost',
       arguments: {
         type: 'project',
@@ -403,7 +438,7 @@ describe('tools', () => {
       name: 'New Project',
       region: 'us-east-1',
       organization_id: freeOrg.id,
-      confirm_cost_id,
+      confirm_cost_id: confirm_cost_id_result.confirmation_id,
     };
 
     const result = callTool({
@@ -425,7 +460,7 @@ describe('tools', () => {
       allowed_release_channels: ['ga'],
     });
 
-    const confirm_cost_id = await callTool({
+    const confirm_cost_id_result = await callTool({
       name: 'confirm_cost',
       arguments: {
         type: 'project',
@@ -437,7 +472,7 @@ describe('tools', () => {
     const newProject = {
       name: 'New Project',
       organization_id: freeOrg.id,
-      confirm_cost_id,
+      confirm_cost_id: confirm_cost_id_result.confirmation_id,
     };
 
     const createProjectPromise = callTool({
@@ -603,10 +638,10 @@ describe('tools', () => {
         project_id: project.id,
       },
     });
-    expect(result).toEqual(`https://${project.id}.supabase.co`);
+    expect(result).toEqual({ url: `https://${project.id}.supabase.co` });
   });
 
-  test('get anon key', async () => {
+  test('get anon or publishable keys', async () => {
     const { callTool } = await setup();
     const org = await createOrganization({
       name: 'My Org',
@@ -621,12 +656,31 @@ describe('tools', () => {
     project.status = 'ACTIVE_HEALTHY';
 
     const result = await callTool({
-      name: 'get_anon_key',
+      name: 'get_publishable_keys',
       arguments: {
         project_id: project.id,
       },
     });
-    expect(result).toEqual('dummy-anon-key');
+
+    expect(result.keys).toBeInstanceOf(Array);
+    expect(result.keys.length).toBe(2);
+
+    // Check legacy anon key
+    const anonKey = result.keys.find((key: any) => key.name === 'anon');
+    expect(anonKey).toBeDefined();
+    expect(anonKey.api_key).toEqual('dummy-anon-key');
+    expect(anonKey.type).toEqual('legacy');
+    expect(anonKey.id).toEqual('anon-key-id');
+    expect(anonKey.disabled).toBe(true);
+
+    // Check publishable key
+    const publishableKey = result.keys.find(
+      (key: any) => key.type === 'publishable'
+    );
+    expect(publishableKey).toBeDefined();
+    expect(publishableKey.api_key).toEqual('sb_publishable_dummy_key_1');
+    expect(publishableKey.type).toEqual('publishable');
+    expect(publishableKey.description).toEqual('Main publishable key');
   });
 
   test('list storage buckets', async () => {
@@ -655,9 +709,9 @@ describe('tools', () => {
       },
     });
 
-    expect(Array.isArray(result)).toBe(true);
-    expect(result.length).toBe(2);
-    expect(result[0]).toEqual(
+    expect(Array.isArray(result.buckets)).toBe(true);
+    expect(result.buckets.length).toBe(2);
+    expect(result.buckets[0]).toEqual(
       expect.objectContaining({
         name: 'bucket1',
         public: true,
@@ -665,7 +719,7 @@ describe('tools', () => {
         updated_at: expect.any(String),
       })
     );
-    expect(result[1]).toEqual(
+    expect(result.buckets[1]).toEqual(
       expect.objectContaining({
         name: 'bucket2',
         public: false,
@@ -805,10 +859,14 @@ describe('tools', () => {
       },
     });
 
-    expect(result).toContain('untrusted user data');
-    expect(result).toMatch(/<untrusted-data-\w{8}-\w{4}-\w{4}-\w{4}-\w{12}>/);
-    expect(result).toContain(JSON.stringify([{ sum: 2 }]));
-    expect(result).toMatch(/<\/untrusted-data-\w{8}-\w{4}-\w{4}-\w{4}-\w{12}>/);
+    expect(result.result).toContain('untrusted user data');
+    expect(result.result).toMatch(
+      /<untrusted-data-\w{8}-\w{4}-\w{4}-\w{4}-\w{12}>/
+    );
+    expect(result.result).toContain(JSON.stringify([{ sum: 2 }]));
+    expect(result.result).toMatch(
+      /<\/untrusted-data-\w{8}-\w{4}-\w{4}-\w{4}-\w{12}>/
+    );
   });
 
   test('can run read queries in read-only mode', async () => {
@@ -837,10 +895,14 @@ describe('tools', () => {
       },
     });
 
-    expect(result).toContain('untrusted user data');
-    expect(result).toMatch(/<untrusted-data-\w{8}-\w{4}-\w{4}-\w{4}-\w{12}>/);
-    expect(result).toContain(JSON.stringify([{ sum: 2 }]));
-    expect(result).toMatch(/<\/untrusted-data-\w{8}-\w{4}-\w{4}-\w{4}-\w{12}>/);
+    expect(result.result).toContain('untrusted user data');
+    expect(result.result).toMatch(
+      /<untrusted-data-\w{8}-\w{4}-\w{4}-\w{4}-\w{12}>/
+    );
+    expect(result.result).toContain(JSON.stringify([{ sum: 2 }]));
+    expect(result.result).toMatch(
+      /<\/untrusted-data-\w{8}-\w{4}-\w{4}-\w{4}-\w{12}>/
+    );
   });
 
   test('cannot run write queries in read-only mode', async () => {
@@ -913,7 +975,7 @@ describe('tools', () => {
       },
     });
 
-    expect(listMigrationsResult).toEqual([
+    expect(listMigrationsResult.migrations).toEqual([
       {
         name,
         version: expect.stringMatching(/^\d{14}$/),
@@ -925,13 +987,13 @@ describe('tools', () => {
       arguments: {
         project_id: project.id,
         schemas: ['public'],
+        verbose: true,
       },
     });
 
-    expect(listTablesResult).toEqual([
+    expect(listTablesResult.tables).toEqual([
       {
-        schema: 'public',
-        name: 'test',
+        name: 'public.test',
         rls_enabled: false,
         rows: 0,
         columns: [
@@ -946,6 +1008,144 @@ describe('tools', () => {
         primary_keys: ['id'],
       },
     ]);
+    expect(listTablesResult.advisory).toEqual(
+      expect.objectContaining({ id: 'rls_disabled' })
+    );
+  });
+
+  test('list_tables returns compact summary by default', async () => {
+    const { callTool } = await setup();
+
+    const org = await createOrganization({
+      name: 'My Org',
+      plan: 'free',
+      allowed_release_channels: ['ga'],
+    });
+
+    const project = await createProject({
+      name: 'Project 1',
+      region: 'us-east-1',
+      organization_id: org.id,
+    });
+    project.status = 'ACTIVE_HEALTHY';
+
+    await project.db.exec(
+      'create table test (id integer generated always as identity primary key)'
+    );
+
+    const result = await callTool({
+      name: 'list_tables',
+      arguments: {
+        project_id: project.id,
+        schemas: ['public'],
+      },
+    });
+
+    expect(result).toEqual({
+      tables: [
+        {
+          name: 'public.test',
+          rls_enabled: false,
+          rows: 0,
+        },
+      ],
+      advisory: {
+        id: 'rls_disabled',
+        priority: 1,
+        level: 'critical',
+        title: 'Row Level Security is disabled',
+        message: expect.stringContaining('public.test'),
+        remediation_sql: 'ALTER TABLE public.test ENABLE ROW LEVEL SECURITY;',
+        doc_url: expect.stringContaining('row-level-security'),
+      },
+    });
+  });
+
+  test('list_tables returns full details when verbose is true', async () => {
+    const { callTool } = await setup();
+
+    const org = await createOrganization({
+      name: 'My Org',
+      plan: 'free',
+      allowed_release_channels: ['ga'],
+    });
+
+    const project = await createProject({
+      name: 'Project 1',
+      region: 'us-east-1',
+      organization_id: org.id,
+    });
+    project.status = 'ACTIVE_HEALTHY';
+
+    await project.db.exec(`
+      create table users (id integer generated always as identity primary key);
+      create table orders (
+        id integer generated always as identity primary key,
+        user_id integer references users(id)
+      );
+    `);
+
+    const result = await callTool({
+      name: 'list_tables',
+      arguments: {
+        project_id: project.id,
+        schemas: ['public'],
+        verbose: true,
+      },
+    });
+
+    // Verbose mode should include columns, primary_keys, and foreign_key_constraints
+    const ordersTable = result.tables.find(
+      (t: { name: string }) => t.name === 'public.orders'
+    );
+    expect(ordersTable).toEqual(
+      expect.objectContaining({
+        columns: expect.arrayContaining([
+          expect.objectContaining({ name: 'id' }),
+          expect.objectContaining({ name: 'user_id' }),
+        ]),
+        primary_keys: ['id'],
+        foreign_key_constraints: [
+          expect.objectContaining({
+            source: 'public.orders.user_id',
+            target: 'public.users.id',
+          }),
+        ],
+      })
+    );
+  });
+
+  test('list_tables omits advisory when all tables have RLS enabled', async () => {
+    const { callTool } = await setup();
+
+    const org = await createOrganization({
+      name: 'My Org',
+      plan: 'free',
+      allowed_release_channels: ['ga'],
+    });
+
+    const project = await createProject({
+      name: 'Project 1',
+      region: 'us-east-1',
+      organization_id: org.id,
+    });
+    project.status = 'ACTIVE_HEALTHY';
+
+    await project.db.exec(`
+      create table test (id serial primary key);
+      alter table test enable row level security;
+    `);
+
+    const result = await callTool({
+      name: 'list_tables',
+      arguments: {
+        project_id: project.id,
+        schemas: ['public'],
+      },
+    });
+
+    expect(result.tables[0].rls_enabled).toBe(true);
+    expect(result.advisory).toBeUndefined();
   });
 
   test('cannot apply migration in read-only mode', async () => {
@@ -1012,11 +1212,11 @@ describe('tools', () => {
       },
     });
 
-    expect(result).toEqual(
-      expect.arrayContaining([expect.objectContaining({ name: 'test_2' })])
+    expect(result.tables).toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: 'test.test_2' })])
     );
-    expect(result).not.toEqual(
-      expect.arrayContaining([expect.objectContaining({ name: 'test_1' })])
+    expect(result.tables).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: 'test.test_1' })])
     );
   });
 
@@ -1060,6 +1260,42 @@ describe('tools', () => {
     );
   });
 
+  test('list_tables is not vulnerable to SQL injection via schemas parameter', async () => {
+    const { callTool } = await setup();
+
+    const org = await createOrganization({
+      name: 'SQLi Org',
+      plan: 'free',
+      allowed_release_channels: ['ga'],
+    });
+
+    const project = await createProject({
+      name: 'SQLi Project',
+      region: 'us-east-1',
+      organization_id: org.id,
+    });
+    project.status = 'ACTIVE_HEALTHY';
+
+    // Attempt SQL injection via schemas parameter using payload from HackerOne report
+    // This payload attempts to break out of the string and inject a division by zero expression
+    // Reference: https://linear.app/supabase/issue/AI-139
+    const maliciousSchema = "public') OR (SELECT 1)=1/0--";
+
+    // With proper parameterization, this should NOT throw "division by zero" error
+    // The literal schema name doesn't exist, so it should return empty array
+    // WITHOUT parameterization, this would throw: "division by zero" error
+    const maliciousResult = await callTool({
+      name: 'list_tables',
+      arguments: {
+        project_id: project.id,
+        schemas: [maliciousSchema],
+      },
+    });
+
+    // Should return empty array without errors, proving the SQL injection was prevented
+    expect(maliciousResult.tables).toEqual([]);
+  });
+
   test('list extensions', async () => {
     const { callTool } = await setup();
 
@@ -1083,7 +1319,7 @@ describe('tools', () => {
       },
     });
 
-    expect(result).toMatchInlineSnapshot(`
+    expect(result.extensions).toMatchInlineSnapshot(`
       [
         {
           "comment": "PL/pgSQL procedural language",
@@ -1198,7 +1434,7 @@ describe('tools', () => {
     ] as const;
 
     for (const service of services) {
-      const result = await callTool({
+      const { result } = await callTool({
         name: 'get_logs',
         arguments: {
           project_id: project.id,
@@ -1226,7 +1462,7 @@ describe('tools', () => {
     });
     project.status = 'ACTIVE_HEALTHY';
 
-    const result = await callTool({
+    const { result } = await callTool({
       name: 'get_advisors',
       arguments: {
         project_id: project.id,
@@ -1253,7 +1489,7 @@ describe('tools', () => {
     });
     project.status = 'ACTIVE_HEALTHY';
 
-    const result = await callTool({
+    const { result } = await callTool({
       name: 'get_advisors',
       arguments: {
         project_id: project.id,
@@ -1288,7 +1524,7 @@ describe('tools', () => {
         service: invalidService,
       },
     });
-    await expect(getLogsPromise).rejects.toThrow('Invalid enum value');
+    await expect(getLogsPromise).rejects.toThrow('Invalid option');
   });
 
   test('list edge functions', async () => {
@@ -1332,7 +1568,7 @@ describe('tools', () => {
       },
     });
 
-    expect(result).toEqual([
+    expect(result.functions).toEqual([
       {
         id: edgeFunction.id,
         slug: edgeFunction.slug,
@@ -1340,15 +1576,10 @@ describe('tools', () => {
         name: edgeFunction.name,
         status: edgeFunction.status,
         entrypoint_path: 'index.ts',
-        import_map_path: undefined,
         import_map: false,
         verify_jwt: true,
-        created_at: expect.stringMatching(
-          /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/
-        ),
-        updated_at: expect.stringMatching(
-          /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/
-        ),
+        created_at: expect.any(Number),
+        updated_at: expect.any(Number),
       },
     ]);
   });
@@ -1402,15 +1633,10 @@ describe('tools', () => {
       name: edgeFunction.name,
       status: edgeFunction.status,
       entrypoint_path: 'index.ts',
-      import_map_path: undefined,
       import_map: false,
       verify_jwt: true,
-      created_at: expect.stringMatching(
-        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/
-      ),
-      updated_at: expect.stringMatching(
-        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/
-      ),
+      created_at: expect.any(Number),
+      updated_at: expect.any(Number),
       files: [
         {
           name: 'index.ts',
@@ -1460,15 +1686,10 @@ describe('tools', () => {
       name: functionName,
       status: 'ACTIVE',
       entrypoint_path: expect.stringMatching(/index\.ts$/),
-      import_map_path: undefined,
       import_map: false,
       verify_jwt: true,
-      created_at: expect.stringMatching(
-        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/
-      ),
-      updated_at: expect.stringMatching(
-        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/
-      ),
+      created_at: expect.any(Number),
+      updated_at: expect.any(Number),
     });
   });
 
@@ -1508,6 +1729,85 @@ describe('tools', () => {
     await expect(result).rejects.toThrow(
       'Cannot deploy an edge function in read-only mode.'
     );
+  });
+
+  test('deploy edge function validates slug format', async () => {
+    const { callTool } = await setup();
+
+    const org = await createOrganization({
+      name: 'test-org',
+      plan: 'free',
+      allowed_release_channels: ['ga'],
+    });
+
+    const project = await createProject({
+      name: 'test-app',
+      region: 'us-east-1',
+      organization_id: org.id,
+    });
+    project.status = 'ACTIVE_HEALTHY';
+
+    const functionInvalidSlugs = [
+      // Leading character violations
+      '[DEPRECATED] hello-world', // leading bracket
+      '_hello-world', // leading underscore
+      '-hello-world', // leading hyphen
+      '0hello-world', // leading digit
+      '#hello-world', // leading special char
+      '.hello-world', // leading dot
+
+      // Trailing character violations
+      'hello-world ', // trailing space
+      'hello-world.', // trailing dot
+      'hello-world#', // trailing hash
+      'hello-world!', // trailing exclamation
+      'hello-world@', // trailing at sign
+      'hello-world[', // trailing bracket
+
+      // Whitespace
+      'hello world', // space
+      'hello\tworld', // tab
+      'hello\nworld', // newline
+      ' hello-world', // leading space
+
+      // Special characters in body
+      'hello.world', // dot
+      'hello@world', // at sign
+      'hello/world', // slash
+      'hello\\world', // backslash
+      'hello$world', // dollar sign
+      'hello!world', // exclamation
+
+      // Edge cases
+      '', // empty string
+      ' ', // only space
+      '-', // only hyphen
+      '_', // only underscore
+    ];
+
+    const functionCode = 'console.log("Hello, world!");';
+
+    functionInvalidSlugs
+      .map((slug) =>
+        callTool({
+          name: 'deploy_edge_function',
+          arguments: {
+            project_id: project.id,
+            name: slug,
+            files: [
+              {
+                name: 'index.ts',
+                content: functionCode,
+              },
+            ],
+          },
+        })
+      )
+      .forEach(async (result) => {
+        await expect(result).rejects.toThrow(
+          'Invalid string: must match pattern'
+        );
+      });
   });
 
   test('deploy new version of existing edge function', async () => {
@@ -1565,21 +1865,14 @@ describe('tools', () => {
       name: functionName,
       status: 'ACTIVE',
       entrypoint_path: expect.stringMatching(/index\.ts$/),
-      import_map_path: undefined,
       import_map: false,
       verify_jwt: true,
-      created_at: expect.stringMatching(
-        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/
-      ),
-      updated_at: expect.stringMatching(
-        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/
-      ),
+      created_at: expect.any(Number),
+      updated_at: expect.any(Number),
     });
 
-    expect(new Date(result.created_at).getTime()).toEqual(originalCreatedAt);
-    expect(new Date(result.updated_at).getTime()).toBeGreaterThan(
-      originalUpdatedAt
-    );
+    expect(result.created_at).toEqual(originalCreatedAt);
+    expect(result.updated_at).toBeGreaterThan(originalUpdatedAt);
   });
 
   test('custom edge function import map', async () => {
@@ -1758,6 +2051,143 @@ describe('tools', () => {
     expect(result.import_map_path).toMatch(/custom-map\.json$/);
   });
 
+  test('deploy edge function with verify_jwt disabled', async () => {
+    const { callTool } = await setup();
+
+    const org = await createOrganization({
+      name: 'My Org',
+      plan: 'free',
+      allowed_release_channels: ['ga'],
+    });
+
+    const project = await createProject({
+      name: 'Project 1',
+      region: 'us-east-1',
+      organization_id: org.id,
+    });
+    project.status = 'ACTIVE_HEALTHY';
+
+    const functionName = 'webhook-handler';
+    const functionCode = 'console.log("Webhook handler");';
+
+    const result = await callTool({
+      name: 'deploy_edge_function',
+      arguments: {
+        project_id: project.id,
+        name: functionName,
+        verify_jwt: false,
+        files: [
+          {
+            name: 'index.ts',
+            content: functionCode,
+          },
+        ],
+      },
+    });
+
+    expect(result).toEqual({
+      id: expect.stringMatching(/^.+$/),
+      slug: functionName,
+      version: 1,
+      name: functionName,
+      status: 'ACTIVE',
+      entrypoint_path: expect.stringMatching(/index\.ts$/),
+      import_map: false,
+      verify_jwt: false,
+      created_at: expect.any(Number),
+      updated_at: expect.any(Number),
+    });
+  });
+
+  test('deploy edge function with verify_jwt enabled (default)', async () => {
+    const { callTool } = await setup();
+
+    const org = await createOrganization({
+      name: 'My Org',
+      plan: 'free',
+      allowed_release_channels: ['ga'],
+    });
+
+    const project = await createProject({
+      name: 'Project 1',
+      region: 'us-east-1',
+      organization_id: org.id,
+    });
+    project.status = 'ACTIVE_HEALTHY';
+
+    const functionName = 'authenticated-function';
+    const functionCode = 'console.log("Authenticated function");';
+
+    const result = await callTool({
+      name: 'deploy_edge_function',
+      arguments: {
+        project_id: project.id,
+        name: functionName,
+        files: [
+          {
+            name: 'index.ts',
+            content: functionCode,
+          },
+        ],
+      },
+    });
+
+    expect(result.verify_jwt).toBe(true);
+  });
+
+  test('update edge function verify_jwt from true to false', async () => {
+    const { callTool } = await setup();
+    const org = await createOrganization({
+      name: 'My Org',
+      plan: 'free',
+      allowed_release_channels: ['ga'],
+    });
+
+    const project = await createProject({
+      name: 'Project 1',
+      region: 'us-east-1',
+      organization_id: org.id,
+    });
+    project.status = 'ACTIVE_HEALTHY';
+
+    const functionName = 'my-function';
+
+    // First deploy with verify_jwt: true (default)
+    const edgeFunction = await project.deployEdgeFunction(
+      {
+        name: functionName,
+        entrypoint_path: 'index.ts',
+        verify_jwt: true,
+      },
+      [
+        new File(['console.log("v1");'], 'index.ts', {
+          type: 'application/typescript',
+        }),
+      ]
+    );
+
+    expect(edgeFunction.verify_jwt).toBe(true);
+
+    // Update with verify_jwt: false
+    const result = await callTool({
+      name: 'deploy_edge_function',
+      arguments: {
+        project_id: project.id,
+        name: functionName,
+        verify_jwt: false,
+        files: [
+          {
+            name: 'index.ts',
+            content: 'console.log("v2");',
+          },
+        ],
+      },
+    });
+
+    expect(result.verify_jwt).toBe(false);
+    expect(result.version).toBe(2);
+  });
+
   test('create branch', async () => {
     const { callTool } = await setup({
       features: ['account', 'branching'],
@@ -1776,7 +2206,7 @@ describe('tools', () => {
     });
     project.status = 'ACTIVE_HEALTHY';
 
-    const confirm_cost_id = await callTool({
+    const confirm_cost_id_result = await callTool({
       name: 'confirm_cost',
       arguments: {
         type: 'branch',
@@ -1791,7 +2221,7 @@ describe('tools', () => {
       arguments: {
         project_id: project.id,
         name: branchName,
-        confirm_cost_id,
+        confirm_cost_id: confirm_cost_id_result.confirmation_id,
       },
     });
 
@@ -1802,6 +2232,7 @@ describe('tools', () => {
       parent_project_ref: project.id,
       is_default: false,
       persistent: false,
+      with_data: false,
       status: 'CREATING_PROJECT',
       created_at: expect.stringMatching(
         /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/
@@ -1831,7 +2262,7 @@ describe('tools', () => {
     });
     project.status = 'ACTIVE_HEALTHY';
 
-    const confirm_cost_id = await callTool({
+    const confirm_cost_id_result = await callTool({
       name: 'confirm_cost',
       arguments: {
         type: 'branch',
@@ -1846,7 +2277,7 @@ describe('tools', () => {
       arguments: {
         project_id: project.id,
         name: branchName,
-        confirm_cost_id,
+        confirm_cost_id: confirm_cost_id_result.confirmation_id,
       },
     });
 
@@ -1903,7 +2334,7 @@ describe('tools', () => {
     });
     project.status = 'ACTIVE_HEALTHY';
 
-    const confirm_cost_id = await callTool({
+    const confirm_cost_id_result = await callTool({
       name: 'confirm_cost',
       arguments: {
         type: 'branch',
@@ -1917,7 +2348,7 @@ describe('tools', () => {
       arguments: {
         project_id: project.id,
         name: 'test-branch',
-        confirm_cost_id,
+        confirm_cost_id: confirm_cost_id_result.confirmation_id,
       },
     });
 
@@ -1928,10 +2359,10 @@ describe('tools', () => {
       },
     });
 
-    expect(listBranchesResult).toContainEqual(
+    expect(listBranchesResult.branches).toContainEqual(
       expect.objectContaining({ id: branch.id })
     );
-    expect(listBranchesResult).toHaveLength(2);
+    expect(listBranchesResult.branches).toHaveLength(2);
 
     await callTool({
       name: 'delete_branch',
@@ -1947,12 +2378,12 @@ describe('tools', () => {
       },
     });
 
-    expect(listBranchesResultAfterDelete).not.toContainEqual(
+    expect(listBranchesResultAfterDelete.branches).not.toContainEqual(
       expect.objectContaining({ id: branch.id })
     );
-    expect(listBranchesResultAfterDelete).toHaveLength(1);
+    expect(listBranchesResultAfterDelete.branches).toHaveLength(1);
 
-    const mainBranch = listBranchesResultAfterDelete[0];
+    const mainBranch = listBranchesResultAfterDelete.branches.at(-1);
 
     const deleteBranchPromise = callTool({
       name: 'delete_branch',
@@ -1997,8 +2428,8 @@ describe('tools', () => {
       },
     });
 
-    expect(listBranchesResult).toHaveLength(1);
-    expect(listBranchesResult).toContainEqual(
+    expect(listBranchesResult.branches).toHaveLength(1);
+    expect(listBranchesResult.branches).toContainEqual(
       expect.objectContaining({ id: branch.id })
     );
 
@@ -2037,7 +2468,7 @@ describe('tools', () => {
       },
     });
 
-    expect(result).toStrictEqual([]);
+    expect(result.branches).toStrictEqual([]);
   });
 
   test('merge branch', async () => {
@@ -2058,7 +2489,7 @@ describe('tools', () => {
     });
     project.status = 'ACTIVE_HEALTHY';
 
-    const confirm_cost_id = await callTool({
+    const confirm_cost_id_result = await callTool({
       name: 'confirm_cost',
       arguments: {
         type: 'branch',
@@ -2072,7 +2503,7 @@ describe('tools', () => {
       arguments: {
         project_id: project.id,
         name: 'test-branch',
-        confirm_cost_id,
+        confirm_cost_id: confirm_cost_id_result.confirmation_id,
       },
     });
 
@@ -2103,7 +2534,7 @@ describe('tools', () => {
       },
     });
 
-    expect(listResult).toContainEqual({
+    expect(listResult.migrations).toContainEqual({
       name: migrationName,
       version: expect.stringMatching(/^\d{14}$/),
     });
@@ -2163,7 +2594,7 @@ describe('tools', () => {
     });
     project.status = 'ACTIVE_HEALTHY';
 
-    const confirm_cost_id = await callTool({
+    const confirm_cost_id_result = await callTool({
       name: 'confirm_cost',
       arguments: {
         type: 'branch',
@@ -2177,7 +2608,7 @@ describe('tools', () => {
       arguments: {
         project_id: project.id,
         name: 'test-branch',
-        confirm_cost_id,
+        confirm_cost_id: confirm_cost_id_result.confirmation_id,
       },
     });
 
@@ -2199,8 +2630,8 @@ describe('tools', () => {
       },
     });
 
-    expect(firstTablesResult).toContainEqual(
-      expect.objectContaining({ name: 'test_untracked' })
+    expect(firstTablesResult.tables).toContainEqual(
+      expect.objectContaining({ name: 'public.test_untracked' })
     );
 
     await callTool({
@@ -2218,8 +2649,8 @@ describe('tools', () => {
     });
 
     // Expect the untracked table to be removed after reset
-    expect(secondTablesResult).not.toContainEqual(
-      expect.objectContaining({ name: 'test_untracked' })
+    expect(secondTablesResult.tables).not.toContainEqual(
+      expect.objectContaining({ name: 'public.test_untracked' })
     );
   });
 
@@ -2277,7 +2708,7 @@ describe('tools', () => {
     });
     project.status = 'ACTIVE_HEALTHY';
 
-    const confirm_cost_id = await callTool({
+    const confirm_cost_id_result = await callTool({
       name: 'confirm_cost',
       arguments: {
         type: 'branch',
@@ -2291,7 +2722,7 @@ describe('tools', () => {
       arguments: {
         project_id: project.id,
         name: 'test-branch',
-        confirm_cost_id,
+        confirm_cost_id: confirm_cost_id_result.confirmation_id,
       },
     });
 
@@ -2315,7 +2746,7 @@ describe('tools', () => {
       },
     });
 
-    expect(firstListResult).toContainEqual({
+    expect(firstListResult.migrations).toContainEqual({
       name: migrationName,
       version: expect.stringMatching(/^\d{14}$/),
     });
@@ -2327,8 +2758,8 @@ describe('tools', () => {
       },
     });
 
-    expect(firstTablesResult).toContainEqual(
-      expect.objectContaining({ name: 'sample' })
+    expect(firstTablesResult.tables).toContainEqual(
+      expect.objectContaining({ name: 'public.sample' })
     );
 
     await callTool({
@@ -2347,7 +2778,7 @@ describe('tools', () => {
       },
     });
 
-    expect(secondListResult).toStrictEqual([]);
+    expect(secondListResult.migrations).toStrictEqual([]);
 
     const secondTablesResult = await callTool({
       name: 'list_tables',
@@ -2356,8 +2787,8 @@ describe('tools', () => {
       },
     });
 
-    expect(secondTablesResult).not.toContainEqual(
-      expect.objectContaining({ name: 'sample' })
+    expect(secondTablesResult.tables).not.toContainEqual(
+      expect.objectContaining({ name: 'public.sample' })
     );
   });
 
@@ -2379,7 +2810,7 @@ describe('tools', () => {
     });
     project.status = 'ACTIVE_HEALTHY';
 
-    const confirm_cost_id = await callTool({
+    const confirm_cost_id_result = await callTool({
       name: 'confirm_cost',
       arguments: {
         type: 'branch',
@@ -2393,7 +2824,7 @@ describe('tools', () => {
       arguments: {
         project_id: project.id,
         name: 'test-branch',
-        confirm_cost_id,
+        confirm_cost_id: confirm_cost_id_result.confirmation_id,
       },
     });
 
@@ -2424,7 +2855,7 @@ describe('tools', () => {
       },
     });
 
-    expect(listResult).toContainEqual({
+    expect(listResult.migrations).toContainEqual({
       name: migrationName,
       version: expect.stringMatching(/^\d{14}$/),
     });
@@ -2509,6 +2940,113 @@ describe('tools', () => {
       ).toBeDefined();
     }
   });
+
+  test('all tools are included in supabaseMcpToolSchemas registry', async () => {
+    // Enable all features to ensure we check all possible tools
+    const { client } = await setup({
+      features: [
+        'docs',
+        'account',
+        'database',
+        'debugging',
+        'development',
+        'functions',
+        'branching',
+        'storage',
+      ],
+    });
+
+    const { tools } = await client.listTools();
+
+    // Check that every tool from the MCP server exists in the registry
+    for (const tool of tools) {
+      expect(
+        supabaseMcpToolSchemas,
+        `Tool "${tool.name}" should be in supabaseMcpToolSchemas registry`
+      ).toHaveProperty(tool.name);
+    }
+
+    // Also verify that the registry doesn't have extra entries
+    // (tools that don't exist in the server)
+    const registryToolNames = Object.keys(supabaseMcpToolSchemas);
+    const serverToolNames = tools.map((t) => t.name);
+
+    const extraToolsInRegistry = registryToolNames.filter(
+      (name) => !serverToolNames.includes(name)
+    );
+
+    expect(
+      extraToolsInRegistry,
+      'Registry should not contain tools that are not in the MCP server when all features are enabled'
+    ).toEqual([]);
+  });
+
+  test('all write tools (readOnlyHint: false) are excluded from readOnly schemas', async () => {
+    // Use readOnly server so dynamic annotations (e.g. execute_sql) reflect
+    // read-only mode correctly — execute_sql reports readOnlyHint: true when
+    // the server is read-only, so it won't be incorrectly caught by the filter below.
+    const { client } = await setup({
+      readOnly: true,
+      features: [
+        'docs',
+        'account',
+        'database',
+        'debugging',
+        'development',
+        'functions',
+        'branching',
+        'storage',
+      ],
+    });
+
+    const { tools } = await client.listTools();
+
+    const writeToolNames = tools
+      .filter((tool) => tool.annotations?.readOnlyHint === false)
+      .map((tool) => tool.name);
+
+    const readOnlySchemas = createToolSchemas({ readOnly: true });
+    const readOnlySchemaKeys = Object.keys(readOnlySchemas);
+
+    for (const name of writeToolNames) {
+      expect(
+        readOnlySchemaKeys,
+        `Write tool "${name}" (readOnlyHint: false) is missing from WRITE_TOOLS — add it to WRITE_TOOLS in tool-schemas.ts`
+      ).not.toContain(name);
+    }
+  });
+
+  test('tool result content is valid JSON', async () => {
+    const org = await createOrganization({
+      name: 'My Org',
+      plan: 'free',
+      allowed_release_channels: ['ga'],
+    });
+
+    const project = await createProject({
+      name: 'Project 1',
+      region: 'us-east-1',
+      organization_id: org.id,
+    });
+    project.status = 'ACTIVE_HEALTHY';
+
+    const { client } = await setup({ projectId: project.id });
+    const resultUntyped = await client.callTool({
+      name: 'list_tables',
+      arguments: { schemas: ['public'] },
+    });
+
+    const result = CallToolResultSchema.parse(resultUntyped);
+    const firstContent = result.content.at(0);
+    if (!firstContent) {
+      throw new Error('Expected content in tool response');
+    }
+    if (firstContent.type !== 'text') {
+      throw new Error('Expected text content in tool response');
+    }
+    const parsedContent = JSON.parse(firstContent.text);
+    expect(parsedContent).toBeTypeOf('object');
+  });
 });
 
 describe('feature groups', () => {
@@ -2571,7 +3109,7 @@ describe('feature groups', () => {
 
     expect(toolNames).toEqual([
       'get_project_url',
-      'get_anon_key',
+      'get_publishable_keys',
       'generate_typescript_types',
     ]);
   });
@@ -2640,7 +3178,7 @@ describe('feature groups', () => {
       features: ['my-invalid-group'],
     });
 
-    await expect(setupPromise).rejects.toThrow('Invalid enum value');
+    await expect(setupPromise).rejects.toThrow('Invalid input');
   });
 
   test('duplicate group behaves like single group', async () => {
@@ -2848,13 +3386,13 @@ describe('project scoped tools', () => {
       name: 'list_tables',
       arguments: {
         schemas: ['public'],
+        verbose: true,
       },
     });
 
-    expect(result).toEqual([
+    expect(result.tables).toEqual([
       expect.objectContaining({
-        name: 'test',
-        schema: 'public',
+        name: 'public.test',
         columns: [
           expect.objectContaining({
             name: 'id',
@@ -2887,7 +3425,7 @@ describe('docs tools', () => {
       },
     });
 
-    expect(result).toEqual({ dummy: true });
+    expect(result).toEqual({ result: { dummy: true } });
   });
 
   test('tool description contains schema', async () => {
@@ -2905,6 +3443,49 @@ describe('docs tools', () => {
       throw new Error('tool description not found');
     }
 
-    expect(tool.description.includes(contentApiMockSchema)).toBe(true);
+    const minifiedSchema = gqlmin(contentApiMockSchema);
+    expect(tool.description.includes(minifiedSchema)).toBe(true);
+  });
+
+  test('schema is only loaded when listing tools', async () => {
+    const { client, callTool } = await setup();
+
+    expect(mockContentApiSchemaLoadCount.value).toBe(0);
+
+    // "tools/list" requests fetch the schema
+    await client.listTools();
+    expect(mockContentApiSchemaLoadCount.value).toBe(1);
+
+    // "tools/call" should not fetch the schema again
+    await callTool({
+      name: 'search_docs',
+      arguments: {
+        graphql_query: '{ searchDocs(query: "test") { nodes { title } } }',
+      },
+    });
+    expect(mockContentApiSchemaLoadCount.value).toBe(1);
+
+    // Additional "tools/list" requests fetch the schema again
+    await client.listTools();
+    expect(mockContentApiSchemaLoadCount.value).toBe(2);
+  });
+});
+
+describe('zod registry', () => {
+  // Zod schemas with `.describe()` auto-register in the global registry. If schemas are defined
+  // inside functions (rather than at module level), new instances register on every call,
+  // causing unbounded memory growth.
+  test('creating multiple servers does not cause unbounded registry growth', async () => {
+    const addSpy = vi.spyOn(globalRegistry, 'add');
+
+    for (let i = 0; i < 9; i++) {
+      const { client } = await setup();
+      await client.listTools();
+    }
+
+    const registryAdditions = addSpy.mock.calls.length;
+    expect(registryAdditions).toBe(0);
+
+    addSpy.mockRestore();
   });
 });

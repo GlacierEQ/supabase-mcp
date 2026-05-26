@@ -2,9 +2,9 @@ import { anthropic } from '@ai-sdk/anthropic';
 import { generateObject } from 'ai';
 import { codeBlock, stripIndent } from 'common-tags';
 import { expect } from 'vitest';
-import { z } from 'zod';
+import { z } from 'zod/v4';
 
-const model = anthropic('claude-3-7-sonnet-20250219');
+const model = anthropic('claude-sonnet-4-6');
 
 expect.extend({
   async toMatchCriteria(received: string, criteria: string) {

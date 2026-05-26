@@ -6,7 +6,7 @@ import {
   tool,
 } from '@supabase/mcp-utils';
 import { processSql, renderHttp } from '@supabase/sql-to-rest';
-import { z } from 'zod';
+import { z } from 'zod/v4';
 import { version } from '../package.json';
 import { ensureNoTrailingSlash, ensureTrailingSlash } from './util.js';
 
@@ -74,8 +74,12 @@ export function createPostgrestMcpServer(options: PostgrestMcpServerOptions) {
             ])
             .optional(),
         }),
+        outputSchema: z.object({ result: z.unknown() }),
         async execute({ method, path, body }) {
-          const url = new URL(`${apiUrl}${path}`);
+          // normalize path concating to apiUrl
+          const { pathname, search } = new URL(path, 'http://mock/');
+          const normalizedPath = `${pathname}${search}`;
+          const url = new URL(`${apiUrl}${normalizedPath}`);
 
           const headers = getHeaders(method);
 
@@ -89,7 +93,7 @@ export function createPostgrestMcpServer(options: PostgrestMcpServerOptions) {
             body: body ? JSON.stringify(body) : undefined,
           });
 
-          return await response.json();
+          return { result: await response.json() };
         },
       }),
       sqlToRest: tool({
@@ -97,6 +101,10 @@ export function createPostgrestMcpServer(options: PostgrestMcpServerOptions) {
           'Converts SQL query to a PostgREST API request (method, path)',
         parameters: z.object({
           sql: z.string(),
+        }),
+        outputSchema: z.object({
+          method: z.string(),
+          path: z.string(),
         }),
         execute: async ({ sql }) => {
           const statement = await processSql(sql);

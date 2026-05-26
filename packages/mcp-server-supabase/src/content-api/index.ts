@@ -1,4 +1,5 @@
-import { z } from 'zod';
+import gqlmin from 'gqlmin';
+import { z } from 'zod/v4';
 import { GraphQLClient, type GraphQLRequest, type QueryFn } from './graphql.js';
 
 const contentApiSchemaResponseSchema = z.object({
@@ -6,7 +7,7 @@ const contentApiSchemaResponseSchema = z.object({
 });
 
 export type ContentApiClient = {
-  schema: string;
+  loadSchema: () => Promise<string>;
   query: QueryFn;
   setUserAgent: (userAgent: string) => void;
 };
@@ -18,18 +19,16 @@ export async function createContentApiClient(
   const graphqlClient = new GraphQLClient({
     url,
     headers,
-    // Content API provides schema string via `schema` query
-    loadSchema: async ({ query }) => {
-      const response = await query({ query: '{ schema }' });
-      const { schema } = contentApiSchemaResponseSchema.parse(response);
-      return schema;
-    },
   });
 
-  const { source } = await graphqlClient.schemaLoaded;
-
   return {
-    schema: source,
+    // Content API provides schema string via `schema` query
+    loadSchema: async () => {
+      const response = await graphqlClient.query({ query: '{ schema }' });
+      const { schema } = contentApiSchemaResponseSchema.parse(response);
+      const minifiedSchema = gqlmin(schema);
+      return minifiedSchema;
+    },
     async query(request: GraphQLRequest) {
       return graphqlClient.query(request);
     },

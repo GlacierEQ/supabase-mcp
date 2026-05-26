@@ -6,7 +6,7 @@ import { http, HttpResponse } from 'msw';
 import { customAlphabet } from 'nanoid';
 import { join } from 'node:path/posix';
 import { expect } from 'vitest';
-import { z } from 'zod';
+import { z } from 'zod/v4';
 import packageJson from '../package.json' with { type: 'json' };
 import {
   getQueryFields,
@@ -80,14 +80,31 @@ export type Migration = {
   query: string;
 };
 
-export const mockOrgs = new Map<string, Organization>();
+export const mockOrgs = new Map<string, MockOrganization>();
 export const mockProjects = new Map<string, MockProject>();
 export const mockBranches = new Map<string, MockBranch>();
 
+export const mockContentApiSchemaLoadCount = { value: 0 };
+
 export const mockContentApi = [
-  http.post(CONTENT_API_URL, async ({ request }) => {
-    const json = await request.json();
-    const { query } = graphqlRequestSchema.parse(json);
+  http.get(CONTENT_API_URL, async ({ request }) => {
+    const requestUrl = new URL(request.url);
+    const queryParam = requestUrl.searchParams.get('query') ?? '';
+    const variablesParam = requestUrl.searchParams.get('variables');
+
+    let variables: Record<string, unknown> | undefined;
+    if (variablesParam) {
+      try {
+        variables = JSON.parse(variablesParam);
+      } catch {
+        throw Error('Invalid query made to Content API');
+      }
+    }
+
+    const { query } = graphqlRequestSchema.parse({
+      query: queryParam,
+      variables,
+    });
 
     const schema = buildSchema(contentApiMockSchema);
     const document = parse(query);
@@ -96,6 +113,7 @@ export const mockContentApi = [
     const [queryName] = getQueryFields(document);
 
     if (queryName === 'schema') {
+      mockContentApiSchemaLoadCount.value++;
       return HttpResponse.json({
         data: {
           schema: contentApiMockSchema,
@@ -171,16 +189,16 @@ export const mockManagementApi = [
     const bodySchema = z.object({
       name: z.string(),
       region: z.string(),
-      organization_id: z.string(),
+      organization_slug: z.string(),
       db_pass: z.string(),
     });
     const body = await request.json();
-    const { name, region, organization_id } = bodySchema.parse(body);
+    const { name, region, organization_slug } = bodySchema.parse(body);
 
     const project = await createProject({
       name,
       region,
-      organization_id,
+      organization_id: organization_slug,
     });
 
     const { database, ...projectResponse } = project.details;
@@ -229,7 +247,11 @@ export const mockManagementApi = [
    */
   http.get(`${API_URL}/v1/organizations`, () => {
     return HttpResponse.json(
-      Array.from(mockOrgs.values()).map(({ id, name }) => ({ id, name }))
+      Array.from(mockOrgs.values()).map(({ id, slug, name }) => ({
+        id,
+        slug,
+        name,
+      }))
     );
   }),
 
@@ -251,14 +273,36 @@ export const mockManagementApi = [
       {
         name: 'anon',
         api_key: 'dummy-anon-key',
+        type: 'legacy',
+        id: 'anon-key-id',
+      },
+      {
+        name: 'publishable-key-1',
+        api_key: 'sb_publishable_dummy_key_1',
+        type: 'publishable',
+        id: 'publishable-key-1-id',
+        description: 'Main publishable key',
       },
     ]);
   }),
 
   /**
+   * Check if legacy API keys are enabled
+   */
+  http.get(
+    `${API_URL}/v1/projects/:projectId/api-keys/legacy`,
+    ({ params }) => {
+      return HttpResponse.json({ enabled: false });
+    }
+  ),
+
+  /**
    * Execute a SQL query on a project's database
    */
-  http.post<{ projectId: string }, { query: string; read_only?: boolean }>(
+  http.post<
+    { projectId: string },
+    { query: string; parameters?: unknown[]; read_only?: boolean }
+  >(
     `${API_URL}/v1/projects/:projectId/database/query`,
     async ({ params, request }) => {
       const project = mockProjects.get(params.projectId);
@@ -269,30 +313,46 @@ export const mockManagementApi = [
         );
       }
       const { db } = project;
-      const { query, read_only } = await request.json();
+      const { query, parameters, read_only } = await request.json();
 
-      // Not secure, but good enough for testing
-      const wrappedQuery = `
-        SET ROLE ${read_only ? 'supabase_read_only_role' : 'postgres'};
-        ${query};
-        RESET ROLE;
-      `;
+      try {
+        // Use transaction to prevent race conditions if tests are parallelized
+        const result = await db.transaction(async (tx) => {
+          // Set role before executing query
+          await tx.exec(
+            `SET ROLE ${read_only ? 'supabase_read_only_role' : 'postgres'};`
+          );
 
-      const statementResults = await db.exec(wrappedQuery);
+          // Use query() method with parameters if provided, otherwise use exec()
+          const queryResult =
+            parameters && parameters.length > 0
+              ? await tx.query(query, parameters)
+              : await tx.exec(query);
 
-      // Remove last result, which is for the "RESET ROLE" statement
-      statementResults.pop();
+          // Reset role
+          await tx.exec('RESET ROLE;');
 
-      const lastStatementResults = statementResults.at(-1);
+          return queryResult;
+        });
 
-      if (!lastStatementResults) {
-        return HttpResponse.json(
-          { message: 'Failed to execute query' },
-          { status: 500 }
-        );
+        // Handle different response formats
+        if (Array.isArray(result)) {
+          // exec() returns an array of results
+          const lastStatementResults = result.at(-1);
+          if (!lastStatementResults) {
+            return HttpResponse.json(
+              { message: 'Failed to execute query' },
+              { status: 500 }
+            );
+          }
+          return HttpResponse.json(lastStatementResults.rows);
+        } else {
+          // query() returns a single result object
+          return HttpResponse.json(result.rows);
+        }
+      } catch (error) {
+        throw error;
       }
-
-      return HttpResponse.json(lastStatementResults.rows);
     }
   ),
 
@@ -405,6 +465,7 @@ export const mockManagementApi = [
         name: z.string(),
         entrypoint_path: z.string(),
         import_map_path: z.string().optional(),
+        verify_jwt: z.boolean().optional(),
       });
 
       const metadataFormValue = formData.get('metadata');
@@ -942,6 +1003,7 @@ export type MockOrganizationOptions = {
 
 export class MockOrganization {
   id: string;
+  slug: string;
   name: Organization['name'];
   plan: Organization['plan'];
   allowed_release_channels: Organization['allowed_release_channels'];
@@ -959,6 +1021,7 @@ export class MockOrganization {
 
   constructor(options: MockOrganizationOptions) {
     this.id = nanoid();
+    this.slug = nanoid();
     this.name = options.name;
     this.plan = options.plan;
     this.allowed_release_channels = options.allowed_release_channels;
@@ -970,6 +1033,7 @@ export type MockEdgeFunctionOptions = {
   name: string;
   entrypoint_path: string;
   import_map_path?: string;
+  verify_jwt?: boolean;
 };
 
 export class MockEdgeFunction {
@@ -1018,14 +1082,19 @@ export class MockEdgeFunction {
       import_map_path: this.import_map_path,
       import_map: this.import_map,
       verify_jwt: this.verify_jwt,
-      created_at: this.created_at.toISOString(),
-      updated_at: this.updated_at.toISOString(),
+      created_at: this.created_at.getTime(),
+      updated_at: this.updated_at.getTime(),
     };
   }
 
   constructor(
     projectId: string,
-    { name, entrypoint_path, import_map_path }: MockEdgeFunctionOptions
+    {
+      name,
+      entrypoint_path,
+      import_map_path,
+      verify_jwt,
+    }: MockEdgeFunctionOptions
   ) {
     this.projectId = projectId;
     this.id = crypto.randomUUID();
@@ -1038,12 +1107,17 @@ export class MockEdgeFunction {
       ? `file://${join(this.pathPrefix, import_map_path)}`
       : undefined;
     this.import_map = !!import_map_path;
-    this.verify_jwt = true;
+    this.verify_jwt = verify_jwt ?? true;
     this.created_at = new Date();
     this.updated_at = new Date();
   }
 
-  update({ name, entrypoint_path, import_map_path }: MockEdgeFunctionOptions) {
+  update({
+    name,
+    entrypoint_path,
+    import_map_path,
+    verify_jwt,
+  }: MockEdgeFunctionOptions) {
     this.name = name;
     this.version += 1;
     this.entrypoint_path = `file://${join(this.pathPrefix, entrypoint_path)}`;
@@ -1051,6 +1125,9 @@ export class MockEdgeFunction {
       ? `file://${join(this.pathPrefix, import_map_path)}`
       : undefined;
     this.import_map = !!import_map_path;
+    if (verify_jwt !== undefined) {
+      this.verify_jwt = verify_jwt;
+    }
     this.updated_at = new Date();
   }
 }
@@ -1084,7 +1161,9 @@ export type MockProjectOptions = {
 
 export class MockProject {
   id: string;
+  ref: string;
   organization_id: string;
+  organization_slug: string;
   name: string;
   region: string;
   created_at: Date;
@@ -1119,7 +1198,9 @@ export class MockProject {
   get details(): Project {
     return {
       id: this.id,
+      ref: this.ref,
       organization_id: this.organization_id,
+      organization_slug: this.organization_slug,
       name: this.name,
       region: this.region,
       created_at: this.created_at.toISOString(),
@@ -1130,10 +1211,12 @@ export class MockProject {
 
   constructor({ name, region, organization_id }: MockProjectOptions) {
     this.id = nanoid();
+    this.ref = this.id;
 
     this.name = name;
     this.region = region;
     this.organization_id = organization_id;
+    this.organization_slug = organization_id;
 
     this.created_at = new Date();
     this.status = 'UNKNOWN';
@@ -1231,6 +1314,7 @@ export class MockBranch {
       parent_project_ref: this.parent_project_ref,
       is_default: this.is_default,
       persistent: this.persistent,
+      with_data: false,
       status: this.status,
       created_at: this.created_at.toISOString(),
       updated_at: this.updated_at.toISOString(),

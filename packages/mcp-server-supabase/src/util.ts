@@ -1,4 +1,4 @@
-import { z } from 'zod';
+import { z } from 'zod/v4';
 import type { SupabasePlatform } from './platform/types.js';
 import { PLATFORM_INDEPENDENT_FEATURES } from './server.js';
 import {
@@ -6,28 +6,6 @@ import {
   featureGroupSchema,
   type FeatureGroup,
 } from './types.js';
-
-export type ValueOf<T> = T[keyof T];
-
-// UnionToIntersection<A | B> = A & B
-export type UnionToIntersection<U> = (
-  U extends unknown ? (arg: U) => 0 : never
-) extends (arg: infer I) => 0
-  ? I
-  : never;
-
-// LastInUnion<A | B> = B
-export type LastInUnion<U> =
-  UnionToIntersection<U extends unknown ? (x: U) => 0 : never> extends (
-    x: infer L
-  ) => 0
-    ? L
-    : never;
-
-// UnionToTuple<A, B> = [A, B]
-export type UnionToTuple<T, Last = LastInUnion<T>> = [T] extends [never]
-  ? []
-  : [Last, ...UnionToTuple<Exclude<T, Last>>];
 
 /**
  * Parses a key-value string into an object.
@@ -101,15 +79,9 @@ export function parseFeatureGroups(
   const availableFeaturesSchema = z.enum(
     availableFeatures as [string, ...string[]],
     {
-      description: 'Available features based on platform implementation',
-      errorMap: (issue, ctx) => {
-        switch (issue.code) {
-          case 'invalid_enum_value':
-            return {
-              message: `This platform does not support the '${issue.received}' feature group. Supported groups are: ${availableFeatures.join(', ')}`,
-            };
-          default:
-            return { message: ctx.defaultError };
+      error: (issue) => {
+        if (issue.code === 'invalid_value') {
+          return `This platform does not support the '${issue.input}' feature group. Supported groups are: ${availableFeatures.join(', ')}`;
         }
       },
     }

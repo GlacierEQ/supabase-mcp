@@ -6,16 +6,11 @@ import {
   validate,
   type DocumentNode,
 } from 'graphql';
-import { z } from 'zod';
+import { z } from 'zod/v4';
 
 export const graphqlRequestSchema = z.object({
   query: z.string(),
   variables: z.record(z.string(), z.unknown()).optional(),
-});
-
-export const graphqlResponseSuccessSchema = z.object({
-  data: z.record(z.string(), z.unknown()),
-  errors: z.undefined(),
 });
 
 export const graphqlErrorSchema = z.object({
@@ -28,15 +23,10 @@ export const graphqlErrorSchema = z.object({
   ),
 });
 
-export const graphqlResponseErrorSchema = z.object({
-  data: z.undefined(),
-  errors: z.array(graphqlErrorSchema),
+export const graphqlResponseSchema = z.object({
+  data: z.record(z.string(), z.unknown()).nullish(),
+  errors: z.array(graphqlErrorSchema).optional(),
 });
-
-export const graphqlResponseSchema = z.union([
-  graphqlResponseSuccessSchema,
-  graphqlResponseErrorSchema,
-]);
 
 export type GraphQLRequest = z.infer<typeof graphqlRequestSchema>;
 export type GraphQLResponse = z.infer<typeof graphqlResponseSchema>;
@@ -121,7 +111,7 @@ export class GraphQLClient {
    */
   async query(
     request: GraphQLRequest,
-    options: QueryOptions = { validateSchema: true }
+    options: QueryOptions = { validateSchema: false }
   ) {
     try {
       // Check that this is a valid GraphQL query
@@ -164,17 +154,19 @@ export class GraphQLClient {
   async #query(request: GraphQLRequest) {
     const { query, variables } = request;
 
-    const response = await fetch(this.#url, {
-      method: 'POST',
+    const url = new URL(this.#url);
+
+    url.searchParams.set('query', query);
+    if (variables !== undefined) {
+      url.searchParams.set('variables', JSON.stringify(variables));
+    }
+
+    const response = await fetch(url, {
+      method: 'GET',
       headers: {
         ...this.#headers,
-        'Content-Type': 'application/json',
         Accept: 'application/json',
       },
-      body: JSON.stringify({
-        query,
-        variables,
-      }),
     });
 
     if (!response.ok) {
@@ -193,7 +185,7 @@ export class GraphQLClient {
       );
     }
 
-    if (data.errors) {
+    if (data.errors?.length) {
       throw new Error(
         `Supabase Content API GraphQL error: ${data.errors
           .map(
@@ -202,6 +194,10 @@ export class GraphQLClient {
           )
           .join(', ')}`
       );
+    }
+
+    if (!data.data) {
+      throw new Error('Supabase Content API returned no data');
     }
 
     return data.data;

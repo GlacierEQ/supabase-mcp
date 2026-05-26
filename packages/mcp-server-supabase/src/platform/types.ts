@@ -1,6 +1,10 @@
 import type { InitData } from '@supabase/mcp-utils';
-import { z } from 'zod';
+import { z } from 'zod/v4';
 import { AWS_REGION_CODES } from '../regions.js';
+
+export type SuccessResponse = {
+  success: true;
+};
 
 export const storageBucketSchema = z.object({
   id: z.string(),
@@ -12,7 +16,7 @@ export const storageBucketSchema = z.object({
 });
 
 export const storageConfigSchema = z.object({
-  fileSizeLimit: z.number(),
+  fileSizeLimit: z.number().int().min(0).max(536_870_912_000), // 500GB
   features: z.object({
     imageTransformation: z.object({ enabled: z.boolean() }),
     s3Protocol: z.object({ enabled: z.boolean() }),
@@ -29,7 +33,9 @@ export const organizationSchema = z.object({
 
 export const projectSchema = z.object({
   id: z.string(),
+  ref: z.string(),
   organization_id: z.string(),
+  organization_slug: z.string(),
   name: z.string(),
   status: z.string(),
   created_at: z.string(),
@@ -82,14 +88,14 @@ export const edgeFunctionWithBodySchema = edgeFunctionSchema.extend({
 });
 
 export const createProjectOptionsSchema = z.object({
-  name: z.string(),
+  name: z.string().min(1).max(256),
   organization_id: z.string(),
   region: z.enum(AWS_REGION_CODES),
   db_pass: z.string().optional(),
 });
 
 export const createBranchOptionsSchema = z.object({
-  name: z.string(),
+  name: z.string().min(1),
 });
 
 export const resetBranchOptionsSchema = z.object({
@@ -97,9 +103,10 @@ export const resetBranchOptionsSchema = z.object({
 });
 
 export const deployEdgeFunctionOptionsSchema = z.object({
-  name: z.string(),
+  name: z.string().regex(/^[A-Za-z][A-Za-z0-9_-]*$/),
   entrypoint_path: z.string(),
   import_map_path: z.string().optional(),
+  verify_jwt: z.boolean().optional(),
   files: z.array(
     z.object({
       name: z.string(),
@@ -109,13 +116,14 @@ export const deployEdgeFunctionOptionsSchema = z.object({
 });
 
 export const executeSqlOptionsSchema = z.object({
-  query: z.string(),
+  query: z.string().min(1),
+  parameters: z.array(z.unknown()).optional(),
   read_only: z.boolean().optional(),
 });
 
 export const applyMigrationOptionsSchema = z.object({
-  name: z.string(),
-  query: z.string(),
+  name: z.string().min(1),
+  query: z.string().min(1),
 });
 
 export const migrationSchema = z.object({
@@ -123,8 +131,18 @@ export const migrationSchema = z.object({
   name: z.string().optional(),
 });
 
+export const logsServiceSchema = z.enum([
+  'api',
+  'branch-action',
+  'postgres',
+  'edge-function',
+  'auth',
+  'storage',
+  'realtime',
+]);
+
 export const getLogsOptionsSchema = z.object({
-  sql: z.string(),
+  service: logsServiceSchema,
   iso_timestamp_start: z.string().optional(),
   iso_timestamp_end: z.string().optional(),
 });
@@ -151,6 +169,7 @@ export type ApplyMigrationOptions = z.infer<typeof applyMigrationOptionsSchema>;
 export type Migration = z.infer<typeof migrationSchema>;
 export type ListMigrationsResult = z.infer<typeof migrationSchema>;
 
+export type LogsService = z.infer<typeof logsServiceSchema>;
 export type GetLogsOptions = z.infer<typeof getLogsOptionsSchema>;
 export type GenerateTypescriptTypesResult = z.infer<
   typeof generateTypescriptTypesResultSchema
@@ -169,7 +188,7 @@ export type DatabaseOperations = {
 };
 
 export type AccountOperations = {
-  listOrganizations(): Promise<Pick<Organization, 'id' | 'name'>[]>;
+  listOrganizations(): Promise<{ id: string; slug: string; name: string }[]>;
   getOrganization(organizationId: string): Promise<Organization>;
   listProjects(): Promise<Project[]>;
   getProject(projectId: string): Promise<Project>;
@@ -196,9 +215,21 @@ export type DebuggingOperations = {
   getPerformanceAdvisors(projectId: string): Promise<unknown>;
 };
 
+export const apiKeyTypeSchema = z.enum(['legacy', 'publishable']);
+export type ApiKeyType = z.infer<typeof apiKeyTypeSchema>;
+
+export type ApiKey = {
+  api_key: string;
+  name: string;
+  type: ApiKeyType;
+  description?: string;
+  id?: string;
+  disabled?: boolean;
+};
+
 export type DevelopmentOperations = {
   getProjectUrl(projectId: string): Promise<string>;
-  getAnonKey(projectId: string): Promise<string>;
+  getPublishableKeys(projectId: string): Promise<ApiKey[]>;
   generateTypescriptTypes(
     projectId: string
   ): Promise<GenerateTypescriptTypesResult>;

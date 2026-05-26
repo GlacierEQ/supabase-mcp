@@ -3,10 +3,10 @@ import {
   parseMultipartStream,
 } from '@mjackson/multipart-parser';
 import type { InitData } from '@supabase/mcp-utils';
-import { relative } from 'node:path/posix';
 import { fileURLToPath } from 'node:url';
 import packageJson from '../../package.json' with { type: 'json' };
 import { getDeploymentId, normalizeFilename } from '../edge-function.js';
+import { getLogQuery } from '../logs.js';
 import {
   assertSuccess,
   createManagementApiClient,
@@ -21,6 +21,8 @@ import {
   getLogsOptionsSchema,
   resetBranchOptionsSchema,
   type AccountOperations,
+  type ApiKey,
+  type ApiKeyType,
   type ApplyMigrationOptions,
   type BranchingOperations,
   type CreateBranchOptions,
@@ -29,6 +31,7 @@ import {
   type DebuggingOperations,
   type DeployEdgeFunctionOptions,
   type DevelopmentOperations,
+  type SuccessResponse,
   type EdgeFunction,
   type EdgeFunctionsOperations,
   type EdgeFunctionWithBody,
@@ -41,6 +44,8 @@ import {
 } from './index.js';
 
 const { version } = packageJson;
+
+const SUCCESS_RESPONSE: SuccessResponse = { success: true };
 
 export type SupabaseApiPlatformOptions = {
   /**
@@ -119,7 +124,7 @@ export function createSupabaseApiPlatform(
         body: {
           name,
           region,
-          organization_id,
+          organization_slug: organization_id,
           db_pass:
             db_pass ??
             generatePassword({
@@ -167,7 +172,8 @@ export function createSupabaseApiPlatform(
 
   const database: DatabaseOperations = {
     async executeSql<T>(projectId: string, options: ExecuteSqlOptions) {
-      const { query, read_only } = executeSqlOptionsSchema.parse(options);
+      const { query, parameters, read_only } =
+        executeSqlOptionsSchema.parse(options);
 
       const response = await managementApiClient.POST(
         '/v1/projects/{ref}/database/query',
@@ -179,6 +185,7 @@ export function createSupabaseApiPlatform(
           },
           body: {
             query,
+            parameters,
             read_only,
           },
         }
@@ -232,8 +239,10 @@ export function createSupabaseApiPlatform(
 
   const debugging: DebuggingOperations = {
     async getLogs(projectId: string, options: GetLogsOptions) {
-      const { sql, iso_timestamp_start, iso_timestamp_end } =
+      const { service, iso_timestamp_start, iso_timestamp_end } =
         getLogsOptionsSchema.parse(options);
+
+      const sql = getLogQuery(service);
 
       const response = await managementApiClient.GET(
         '/v1/projects/{ref}/analytics/endpoints/logs.all',
@@ -294,7 +303,7 @@ export function createSupabaseApiPlatform(
       const apiUrl = new URL(managementApiUrl);
       return `https://${projectId}.${getProjectDomain(apiUrl.hostname)}`;
     },
-    async getAnonKey(projectId: string): Promise<string> {
+    async getPublishableKeys(projectId: string): Promise<ApiKey[]> {
       const response = await managementApiClient.GET(
         '/v1/projects/{ref}/api-keys',
         {
@@ -311,13 +320,54 @@ export function createSupabaseApiPlatform(
 
       assertSuccess(response, 'Failed to fetch API keys');
 
-      const anonKey = response.data?.find((key) => key.name === 'anon');
+      // Try to check if legacy JWT-based keys are enabled
+      // If this fails, we'll continue without the disabled field
+      let legacyKeysEnabled: boolean | undefined = undefined;
+      try {
+        const legacyKeysResponse = await managementApiClient.GET(
+          '/v1/projects/{ref}/api-keys/legacy',
+          {
+            params: {
+              path: {
+                ref: projectId,
+              },
+            },
+          }
+        );
 
-      if (!anonKey?.api_key) {
-        throw new Error('Anonymous key not found');
+        if (legacyKeysResponse.response.ok) {
+          legacyKeysEnabled = legacyKeysResponse.data?.enabled ?? true;
+        }
+      } catch (error) {
+        // If we can't fetch legacy key status, continue without it
+        legacyKeysEnabled = undefined;
       }
 
-      return anonKey.api_key;
+      // Filter for client-safe keys: legacy 'anon' or publishable type
+      const clientKeys =
+        response.data?.filter(
+          (key) => key.name === 'anon' || key.type === 'publishable'
+        ) ?? [];
+
+      if (clientKeys.length === 0) {
+        throw new Error(
+          'No client-safe API keys (anon or publishable) found. Please create a publishable key in your project settings.'
+        );
+      }
+
+      return clientKeys.map((key) => ({
+        api_key: key.api_key!,
+        name: key.name,
+        type: (key.type === 'publishable'
+          ? 'publishable'
+          : 'legacy') satisfies ApiKeyType,
+        // Only include disabled field if we successfully fetched legacy key status
+        ...(legacyKeysEnabled !== undefined && {
+          disabled: key.type === 'legacy' && !legacyKeysEnabled,
+        }),
+        description: key.description ?? undefined,
+        id: key.id ?? undefined,
+      }));
     },
     async generateTypescriptTypes(projectId: string) {
       const response = await managementApiClient.GET(
@@ -495,6 +545,7 @@ export function createSupabaseApiPlatform(
         name,
         entrypoint_path,
         import_map_path,
+        verify_jwt,
         files: inputFiles,
       } = deployEdgeFunctionOptionsSchema.parse(options);
 
@@ -525,6 +576,7 @@ export function createSupabaseApiPlatform(
               name,
               entrypoint_path,
               import_map_path,
+              verify_jwt,
             },
             file: inputFiles as any, // We need to pass file name and content to our serializer
           },
@@ -597,11 +649,11 @@ export function createSupabaseApiPlatform(
     },
     async deleteBranch(branchId: string) {
       const response = await managementApiClient.DELETE(
-        '/v1/branches/{branch_id}',
+        '/v1/branches/{branch_id_or_ref}',
         {
           params: {
             path: {
-              branch_id: branchId,
+              branch_id_or_ref: branchId,
             },
           },
         }
@@ -611,11 +663,11 @@ export function createSupabaseApiPlatform(
     },
     async mergeBranch(branchId: string) {
       const response = await managementApiClient.POST(
-        '/v1/branches/{branch_id}/merge',
+        '/v1/branches/{branch_id_or_ref}/merge',
         {
           params: {
             path: {
-              branch_id: branchId,
+              branch_id_or_ref: branchId,
             },
           },
           body: {},
@@ -628,11 +680,11 @@ export function createSupabaseApiPlatform(
       const { migration_version } = resetBranchOptionsSchema.parse(options);
 
       const response = await managementApiClient.POST(
-        '/v1/branches/{branch_id}/reset',
+        '/v1/branches/{branch_id_or_ref}/reset',
         {
           params: {
             path: {
-              branch_id: branchId,
+              branch_id_or_ref: branchId,
             },
           },
           body: {
@@ -645,11 +697,11 @@ export function createSupabaseApiPlatform(
     },
     async rebaseBranch(branchId: string) {
       const response = await managementApiClient.POST(
-        '/v1/branches/{branch_id}/push',
+        '/v1/branches/{branch_id_or_ref}/push',
         {
           params: {
             path: {
-              branch_id: branchId,
+              branch_id_or_ref: branchId,
             },
           },
           body: {},
@@ -720,8 +772,6 @@ export function createSupabaseApiPlatform(
       );
 
       assertSuccess(response, 'Failed to update storage config');
-
-      return response.data;
     },
   };
 

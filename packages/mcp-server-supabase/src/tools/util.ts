@@ -1,15 +1,26 @@
-import { type Tool, tool } from '@supabase/mcp-utils';
-import type { z } from 'zod';
+import { type Annotations, type Tool, tool } from '@supabase/mcp-utils';
+import { z } from 'zod/v4';
+
+export type ToolDef = {
+  description?: string | (() => string | Promise<string>);
+  parameters: z.ZodObject<any>;
+  outputSchema: z.ZodObject<any>;
+  annotations: Annotations;
+  /** 'adapt' = stays available in read-only mode, adapts behavior. 'exclude' (default) = removed from tool list. */
+  readOnlyBehavior?: 'exclude' | 'adapt';
+};
+
+export type ToolDefs = Record<string, ToolDef>;
 
 type RequireKeys<Injected, Params> = {
   [K in keyof Injected]: K extends keyof Params ? Injected[K] : never;
 };
 
 export type InjectableTool<
-  Params extends z.ZodObject<any> = z.ZodObject<any>,
-  Result = unknown,
+  Params extends z.ZodObject,
+  OutputSchema extends z.ZodObject,
   Injected extends Partial<z.infer<Params>> = {},
-> = Tool<Params, Result> & {
+> = Tool<Params, OutputSchema> & {
   /**
    * Optionally injects static parameter values into the tool's
    * execute function and removes them from the parameter schema.
@@ -21,49 +32,50 @@ export type InjectableTool<
 };
 
 export function injectableTool<
-  Params extends z.ZodObject<any>,
-  Result,
+  Params extends z.ZodObject,
+  OutputSchema extends z.ZodObject,
   Injected extends Partial<z.infer<Params>>,
 >({
   description,
   annotations,
   parameters,
+  outputSchema,
   inject,
   execute,
-}: InjectableTool<Params, Result, Injected>) {
+}: InjectableTool<Params, OutputSchema, Injected>) {
   // If all injected parameters are undefined, return the original tool
   if (!inject || Object.values(inject).every((value) => value === undefined)) {
     return tool({
       description,
       annotations,
       parameters,
+      outputSchema,
       execute,
     });
   }
 
   // Create a mask used to remove injected parameters from the schema
   const mask = Object.fromEntries(
-    Object.entries(inject)
-      .filter(([_, value]) => value !== undefined)
-      .map(([key]) => [key, true as const])
+    Object.keys(inject)
+      .filter((key) => inject[key as keyof Injected] !== undefined)
+      .map((key) => [key, true as const])
   );
 
-  type NonNullableKeys = {
-    [K in keyof Injected]: Injected[K] extends undefined ? never : K;
-  }[keyof Injected];
+  // Schema without injected parameters
+  const cleanParametersSchema = parameters.omit(mask);
 
-  type CleanParams = z.infer<Params> extends any
-    ? {
-        [K in keyof z.infer<Params> as K extends NonNullableKeys
-          ? never
-          : K]: z.infer<Params>[K];
-      }
-    : never;
+  // Wrapper that merges injected values with provided args
+  const executeWithInjection = async (
+    args: z.infer<typeof cleanParametersSchema>
+  ) => {
+    return execute({ ...args, ...inject } as z.infer<Params>);
+  };
 
   return tool({
     description,
     annotations,
-    parameters: parameters.omit(mask),
-    execute: (args) => execute({ ...args, ...inject }),
-  }) as Tool<z.ZodObject<any, any, any, CleanParams>, Result>;
+    parameters: cleanParametersSchema,
+    outputSchema,
+    execute: executeWithInjection,
+  });
 }

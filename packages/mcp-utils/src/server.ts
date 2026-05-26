@@ -12,9 +12,9 @@ import {
   type ReadResourceResult,
   type ServerCapabilities,
   type ListToolsResult,
+  type Tool as McpTool,
 } from '@modelcontextprotocol/sdk/types.js';
-import type { z } from 'zod';
-import zodToJsonSchema from 'zod-to-json-schema';
+import { z } from 'zod/v4';
 import type {
   ExpandRecursively,
   ExtractNotification,
@@ -52,12 +52,15 @@ export type ResourceTemplate<Uri extends string = string, Result = unknown> = {
 
 export type Tool<
   Params extends z.ZodObject<any> = z.ZodObject<any>,
-  Result = unknown,
+  // MCP spec restricts outputSchema to type "object" at the root level:
+  // https://modelcontextprotocol.io/specification/2025-11-25/schema#tool-outputschema
+  OutputSchema extends z.ZodObject<any> = z.ZodObject<any>,
 > = {
-  description: string;
+  description: Prop<string>;
   annotations?: Annotations;
   parameters: Params;
-  execute(params: z.infer<Params>): Promise<Result>;
+  outputSchema: OutputSchema;
+  execute(params: z.infer<Params>): Promise<z.infer<OutputSchema>>;
 };
 
 /**
@@ -164,9 +167,10 @@ export function jsonResourceResponse<Uri extends string, Response>(
 /**
  * Helper function to define an MCP tool while preserving type information.
  */
-export function tool<Params extends z.ZodObject<any>, Result>(
-  tool: Tool<Params, Result>
-) {
+export function tool<
+  Params extends z.ZodObject<any>,
+  OutputSchema extends z.ZodObject<any>,
+>(tool: Tool<Params, OutputSchema>) {
   return tool;
 }
 
@@ -225,6 +229,15 @@ export type McpServerOptions = {
   onInitialize?: InitCallback;
 
   /**
+   * Optional instructions describing how to use the server and its features.
+   *
+   * This can be used by clients to improve the LLM's understanding of available
+   * tools, resources, etc. It can be thought of like a "hint" to the model.
+   * For example, this information MAY be added to the system prompt.
+   */
+  instructions?: string;
+
+  /**
    * Callback for after a tool is called.
    */
   onToolCall?: ToolCallCallback;
@@ -279,6 +292,7 @@ export function createMcpServer(options: McpServerOptions) {
     },
     {
       capabilities,
+      instructions: options.instructions,
     }
   );
 
@@ -436,24 +450,30 @@ export function createMcpServer(options: McpServerOptions) {
       ListToolsRequestSchema,
       async (): Promise<ListToolsResult> => {
         const tools = await getTools();
+
         return {
-          tools: Object.entries(tools).map(
-            ([name, { description, annotations, parameters }]) => {
-              const inputSchema = zodToJsonSchema(parameters);
+          tools: await Promise.all(
+            Object.entries(tools).map(
+              async ([name, { description, annotations, parameters }]) => {
+                const inputSchema = z.toJSONSchema(parameters, {
+                  target: 'draft-7',
+                });
 
-              if (!('properties' in inputSchema)) {
-                throw new Error('tool parameters must be a ZodObject');
+                return {
+                  name,
+                  description:
+                    typeof description === 'function'
+                      ? await description()
+                      : description,
+                  annotations,
+                  // Casting the same as the SDK does:
+                  // https://github.com/modelcontextprotocol/typescript-sdk/blob/fb07af810b51003c338dc4885a9e42f54519f9af/src/server/mcp.ts#L154
+                  inputSchema: inputSchema as McpTool['inputSchema'],
+                };
               }
-
-              return {
-                name,
-                description,
-                annotations,
-                inputSchema,
-              };
-            }
+            )
           ),
-        };
+        } satisfies ListToolsResult;
       }
     );
 
@@ -471,7 +491,6 @@ export function createMcpServer(options: McpServerOptions) {
         if (!tool) {
           throw new Error('tool not found');
         }
-
         const args = tool.parameters
           .strict()
           .parse(request.params.arguments ?? {});
@@ -504,9 +523,10 @@ export function createMcpServer(options: McpServerOptions) {
 
         const result = await executeWithCallback(tool);
 
-        const content = result
-          ? [{ type: 'text', text: JSON.stringify(result) }]
-          : [];
+        const content =
+          result != null
+            ? [{ type: 'text', text: JSON.stringify(result) }]
+            : [];
 
         return {
           content,
